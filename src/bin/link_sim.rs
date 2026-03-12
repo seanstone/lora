@@ -65,7 +65,7 @@ fn tx_packet(
     let codewords = hamming_enc(&padded, cr, sf);
     let symbols   = interleave(&codewords, cr, sf, ldro);
     let chirps    = gray_demap(&symbols, sf);
-    modulate(&chirps, sf, sync_word, preamble_len)
+    modulate(&chirps, sf, sync_word, preamble_len, 1)
 }
 
 // ─── RX pipeline ─────────────────────────────────────────────────────────────
@@ -78,10 +78,10 @@ fn rx_packet(
     sync_word:    u8,
     preamble_len: u16,
 ) -> Option<Vec<u8>> {
-    let sync      = frame_sync(iq, sf, sync_word, preamble_len);
+    let sync      = frame_sync(iq, sf, sync_word, preamble_len, 1);
     if !sync.found { return None; }
 
-    let chirps    = fft_demod(&sync.symbols, sf);
+    let chirps    = fft_demod(&sync.symbols, sf, 1);
     let symbols   = gray_map(&chirps, sf);
     let codewords = deinterleave(&symbols, cr, sf, ldro);
     let nibbles   = hamming_dec(&codewords, cr, sf);
