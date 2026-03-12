@@ -33,13 +33,24 @@ use std::{
     time::Duration,
 };
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Options ──────────────────────────────────────────────────────────────────
 
-/// Fixed simulated sample rate in kHz.  os_factor = SAMP_RATE_KHZ / bw_khz.
-const SAMP_RATE_KHZ: u32 = 1000;
+/// Available sample-rate options (kHz).
+const SR_OPTIONS_KHZ:  &[u32] = &[125, 250, 500, 1000, 2000, 4000];
 
-/// LoRa bandwidth options (kHz).  Default 250 kHz → os_factor = 4.
-const BW_OPTIONS_KHZ: &[u32] = &[125, 250, 500, 1000];
+/// Available signal-bandwidth options (kHz).
+const BW_OPTIONS_KHZ:  &[u32] = &[125, 250, 500, 1000];
+
+fn khz_label(v: u32) -> String {
+    if v >= 1000 { format!("{}M", v / 1000) } else { format!("{}k", v) }
+}
+
+/// Compute os_factor, enlarging samp_rate if it is smaller than bw.
+/// Returns (effective_samp_rate_khz, os_factor).
+fn effective_sr_and_os(samp_rate_khz: u32, bw_khz: u32) -> (u32, u32) {
+    let sr = samp_rate_khz.max(bw_khz);
+    (sr, sr / bw_khz)
+}
 
 // ─── TX / RX helpers ─────────────────────────────────────────────────────────
 
@@ -221,19 +232,21 @@ struct GuiApp {
     spectrum_chart:  Chart,
     waterfall_chart: Chart,
     thread_started:  bool,
-    snr_db:      f32,
-    interval_ms: u64,
-    sf:          u8,
-    bw_khz:      u32,   // signal bandwidth; os_factor = SAMP_RATE_KHZ / bw_khz
-    fft_size:    usize,
+    snr_db:        f32,
+    interval_ms:   u64,
+    sf:            u8,
+    samp_rate_khz: u32,  // selected sample rate; may be enlarged if < bw_khz
+    bw_khz:        u32,  // signal bandwidth; os_factor = effective_sr / bw_khz
+    fft_size:      usize,
 }
 
 impl GuiApp {
     fn new(sf: u8, snr_db: f32) -> Self {
-        // Default: 250 kHz BW → os_factor = 4 (sample rate = 4 × BW).
-        let bw_khz    = 250u32;
-        let os_factor = SAMP_RATE_KHZ / bw_khz;  // = 4
-        let fft_size  = 1024usize;
+        // Default: SR = 1 MHz, BW = 250 kHz → os_factor = 4.
+        let samp_rate_khz = 1000u32;
+        let bw_khz        = 250u32;
+        let (_, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
+        let fft_size      = 1024usize;
 
         let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
 
@@ -276,13 +289,17 @@ impl GuiApp {
             snr_db,
             interval_ms: 250,
             sf,
+            samp_rate_khz,
             bw_khz,
             fft_size,
         }
     }
 
     fn rebuild_plots(&mut self) {
-        let os_factor = SAMP_RATE_KHZ / self.bw_khz;
+        // Enlarge sample rate to at least bw; os_factor must be ≥ 1.
+        let (eff_sr, os_factor) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
+        self.samp_rate_khz = eff_sr;  // reflect the automatic enlargement in the UI
+
         self.spectrum_chart.set_x_limits([0.0, self.fft_size as f64]);
         self.waterfall_chart.set_x_limits([0.0, self.fft_size as f64]);
         *self.shared.sf.lock().unwrap()        = self.sf;
@@ -291,16 +308,6 @@ impl GuiApp {
         self.shared.waterfall_plot.set_freq(self.fft_size as f64 / 2.0);
         self.shared.waterfall_plot.set_bw(self.fft_size as f64);
         *self.shared.stats.lock().unwrap() = Stats::default();
-    }
-}
-
-fn bw_label(bw_khz: u32) -> &'static str {
-    match bw_khz {
-        125  => "125k",
-        250  => "250k",
-        500  => "500k",
-        1000 => "1M",
-        _    => "?",
     }
 }
 
@@ -339,17 +346,38 @@ impl eframe::App for GuiApp {
 
                 ui.separator();
 
-                // BW selector — sample rate is shown as a fixed label.
-                // os_factor = SAMP_RATE_KHZ / bw_khz; default 250 kHz → ×4.
-                ui.label(format!("SR: {} MHz  BW:", SAMP_RATE_KHZ as f32 / 1000.0));
+                // Sample rate selector.
+                ui.label("SR:");
+                for &sr in SR_OPTIONS_KHZ {
+                    if ui.selectable_label(self.samp_rate_khz == sr, khz_label(sr)).clicked()
+                        && self.samp_rate_khz != sr
+                    {
+                        self.samp_rate_khz = sr;
+                        changed = true;
+                    }
+                }
+
+                ui.separator();
+
+                // BW selector.
+                ui.label("BW:");
                 for &bw in BW_OPTIONS_KHZ {
-                    if ui.selectable_label(self.bw_khz == bw, bw_label(bw)).clicked()
+                    if ui.selectable_label(self.bw_khz == bw, khz_label(bw)).clicked()
                         && self.bw_khz != bw
                     {
                         self.bw_khz = bw;
                         changed = true;
                     }
                 }
+
+                // Show inferred OS factor (sr may be auto-enlarged).
+                let (eff_sr, os) = effective_sr_and_os(self.samp_rate_khz, self.bw_khz);
+                let os_str = if eff_sr != self.samp_rate_khz {
+                    format!(" ×{os}↑")   // ↑ indicates sample rate was enlarged
+                } else {
+                    format!(" ×{os}")
+                };
+                ui.label(os_str);
 
                 ui.separator();
 
