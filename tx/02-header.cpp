@@ -1,5 +1,4 @@
-#include <cstdint>
-#include <vector>
+#include "02-header.h"
 
 // Prepends a 5-nibble explicit header to whitened nibbles:
 //   [0]   high nibble of payload length

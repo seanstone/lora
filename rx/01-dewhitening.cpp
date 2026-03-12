@@ -1,4 +1,4 @@
-#include <vector>
+#include "01-dewhitening.h"
 #include "../common/tables.h"
 
 // Reverses whiten(): recombines nibble pairs and XORs with the whitening sequence.

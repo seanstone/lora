@@ -1,11 +1,7 @@
-#include <cstdint>
-#include <vector>
-#include <iostream>
 #include <string>
 #include <cassert>
-
-std::vector<uint8_t> whiten(const std::vector<uint8_t>& payload);
-std::vector<uint8_t> dewhiten(const std::vector<uint8_t>& nibbles);
+#include "../tx/01-whitening.h"
+#include "../rx/01-dewhitening.h"
 
 static void print_hex(const std::vector<uint8_t>& v) {
     for (auto b : v)

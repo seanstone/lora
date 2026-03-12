@@ -1,20 +1,12 @@
-#include <cstdint>
-#include <vector>
+#include "02-header_decoder.h"
 
-struct FrameInfo {
-    uint8_t payload_len;
-    uint8_t cr;
-    bool    has_crc;
-    bool    valid;          // false if checksum mismatch or payload_len == 0
-    std::vector<uint8_t> payload_nibbles;
-};
 
 // Strips the 5-nibble explicit header from a framed nibble stream and validates
 // its checksum. If impl_head is true, the provided cr/pay_len/has_crc are used
 // and the nibbles are returned unchanged.
 FrameInfo decode_header(const std::vector<uint8_t>& frame,
                         bool impl_head,
-                        uint8_t cr = 0, uint32_t pay_len = 0, bool has_crc = false)
+                        uint8_t cr, uint32_t pay_len, bool has_crc)
 {
     if (impl_head) {
         return { (uint8_t)pay_len, cr, has_crc, true,

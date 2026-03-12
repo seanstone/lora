@@ -1,24 +1,10 @@
-#include <cstdint>
-#include <vector>
 #include <string>
 #include <cassert>
 #include <cstdio>
-
-std::vector<uint8_t> whiten(const std::vector<uint8_t>& payload);
-std::vector<uint8_t> dewhiten(const std::vector<uint8_t>& nibbles);
-std::vector<uint8_t> add_header(const std::vector<uint8_t>& nibbles,
-                                bool impl_head, bool has_crc, uint8_t cr);
-
-struct FrameInfo {
-    uint8_t payload_len;
-    uint8_t cr;
-    bool    has_crc;
-    bool    valid;
-    std::vector<uint8_t> payload_nibbles;
-};
-FrameInfo decode_header(const std::vector<uint8_t>& frame,
-                        bool impl_head,
-                        uint8_t cr = 0, uint32_t pay_len = 0, bool has_crc = false);
+#include "../tx/01-whitening.h"
+#include "../tx/02-header.h"
+#include "../rx/01-dewhitening.h"
+#include "../rx/02-header_decoder.h"
 
 // --- add_header unit tests ---
 

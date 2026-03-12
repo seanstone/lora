@@ -1,4 +1,4 @@
-#include <vector>
+#include "01-whitening.h"
 #include "../common/tables.h"
 
 // XORs each input byte with the whitening sequence and outputs two nibbles per byte:
