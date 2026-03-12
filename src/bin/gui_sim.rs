@@ -1,8 +1,11 @@
-/// LoRa GUI simulator — spectrum + waterfall visualisation of the dechirped FFT.
+/// LoRa GUI simulator — raw spectrum + waterfall of the received IQ.
 ///
-/// Each received symbol becomes one waterfall row.  With os_factor > 1 the
-/// LoRa signal occupies the central N bins of the N×os_factor wide display;
-/// the surrounding bins are at the noise floor.
+/// The spectrum/waterfall is a plain windowed FFT of the raw (noisy) IQ signal,
+/// independent of the receiver.  AWGN frames show a flat noise floor; LoRa
+/// packets show the chirp sweeping across the centre of the band.
+///
+/// With os_factor > 1 the LoRa signal bandwidth is narrower than the sample
+/// rate, so the chirp occupies only the central 1/os_factor of the display.
 ///
 /// Usage: gui_sim [sf] [snr_db]   (defaults: sf=7  snr=10)
 
@@ -29,7 +32,7 @@ use std::{
     time::Duration,
 };
 
-// ─── TX helpers ──────────────────────────────────────────────────────────────
+// ─── TX / RX helpers ─────────────────────────────────────────────────────────
 
 fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
     let pay_sf    = if ldro { (sf - 2) as usize } else { sf as usize };
@@ -87,60 +90,40 @@ fn add_awgn(signal: &[Complex<f32>], snr_db: f32, rng: &mut impl Rng) -> Vec<Com
     }).collect()
 }
 
-// ─── Dechirped FFT spectrum per symbol ───────────────────────────────────────
+// ─── Raw spectrum ─────────────────────────────────────────────────────────────
 
-fn make_downchirp(sf: u8) -> Vec<Complex<f32>> {
-    let n = 1usize << sf;
-    (0..n).map(|k| {
-        let t     = k as f64;
-        let phase = t * t / (2.0 * n as f64) - 0.5 * t;
-        let (sin, cos) = (TAU * phase).sin_cos();
-        Complex::new(cos as f32, -sin as f32)
-    }).collect()
-}
-
-/// One `Vec<[f64;2]>` per symbol: x = bin in [0, N×os_factor), y = power dB.
+/// Sliding Hann-windowed FFT of `iq` with step = `fft_size`.
 ///
-/// The LoRa signal occupies the central N bins; surrounding bins are padded to
-/// the noise floor so the chart x-range shows the full sample-rate bandwidth.
-fn symbol_spectra(payload_iq: &[Complex<f32>], sf: u8, os_factor: usize) -> Vec<Vec<[f64; 2]>> {
-    let n         = 1usize << sf;
-    let sps       = n * os_factor;
-    let offset    = (os_factor - 1) * n / 2; // left-pad bins before the signal
-    let right_pad = sps - offset - n;
-
-    let downchirp = make_downchirp(sf);
+/// Returns one `Vec<[f64;2]>` per window: x = bin (0..fft_size), y = power dB.
+/// The output is fftshifted so DC is at bin fft_size/2; the LoRa signal
+/// (bandwidth = samp_rate / os_factor) appears centred.
+fn raw_spectra(iq: &[Complex<f32>], fft_size: usize) -> Vec<Vec<[f64; 2]>> {
     let mut planner = FftPlanner::<f32>::new();
-    let fft       = planner.plan_fft_forward(n);
-    let mut buf   = vec![Complex::new(0.0_f32, 0.0_f32); n];
-    let mut out   = Vec::new();
+    let fft         = planner.plan_fft_forward(fft_size);
+    let mut buf     = vec![Complex::new(0.0_f32, 0.0_f32); fft_size];
 
-    let mut w = 0;
-    while w + sps <= payload_iq.len() {
-        // Stride decimation: take sample 0 of each os_factor-wide group.
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = payload_iq[w + os_factor * i];
-        }
-        // Dechirp.
-        for (b, d) in buf.iter_mut().zip(&downchirp) {
-            *b = *b * d;
+    // Precompute Hann window coefficients.
+    let hann: Vec<f32> = (0..fft_size)
+        .map(|i| (0.5 * (1.0 - (TAU * i as f64 / fft_size as f64).cos())) as f32)
+        .collect();
+
+    let mut out = Vec::new();
+    let mut w   = 0usize;
+    while w + fft_size <= iq.len() {
+        for (b, (s, h)) in buf.iter_mut().zip(iq[w..w + fft_size].iter().zip(hann.iter())) {
+            *b = s * h;
         }
         fft.process(&mut buf);
 
-        // Embed N-bin result into N×os_factor display, signal in center.
-        let mut spec = Vec::with_capacity(sps);
-        for i in 0..offset {
-            spec.push([i as f64, -100.0_f64]);
-        }
-        for (i, &c) in buf.iter().enumerate() {
-            let pdb = 10.0 * (c.norm_sqr() as f64 + 1e-20_f64).log10();
-            spec.push([(offset + i) as f64, pdb.max(-100.0)]);
-        }
-        for i in 0..right_pad {
-            spec.push([(offset + n + i) as f64, -100.0_f64]);
-        }
+        // fftshift: bin 0 → display bin fft_size/2 (DC centred).
+        let half  = fft_size / 2;
+        let spec: Vec<[f64; 2]> = (0..fft_size).map(|i| {
+            let src = (i + half) % fft_size;
+            let pdb = 10.0 * (buf[src].norm_sqr() as f64 + 1e-20_f64).log10();
+            [i as f64, pdb.max(-100.0)]
+        }).collect();
         out.push(spec);
-        w += sps;
+        w += fft_size;
     }
     out
 }
@@ -151,6 +134,7 @@ struct SimShared {
     running:        AtomicBool,
     sf:             Mutex<u8>,
     os_factor:      Mutex<u32>,
+    fft_size:       Mutex<usize>,
     snr_db:         Mutex<f32>,
     interval_ms:    Mutex<u64>,
     spectrum_plot:  Arc<SpectrumPlot>,
@@ -182,39 +166,28 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
 
         let sf          = *shared.sf.lock().unwrap();
         let os_factor   = *shared.os_factor.lock().unwrap();
+        let fft_size    = *shared.fft_size.lock().unwrap();
         let snr_db      = *shared.snr_db.lock().unwrap();
         let interval_ms = *shared.interval_ms.lock().unwrap();
-        let n           = 1usize << sf;
-        let n_sps       = n * os_factor as usize;
         let payload     = payloads[idx % payloads.len()];
         idx += 1;
 
-        // TX → channel → RX
+        // TX → channel.
         let iq    = tx_packet(payload, sf, 4, os_factor);
         let noisy = add_awgn(&iq, snr_db, &mut rng);
 
-        // Per-symbol dechirped spectra for the plots.
-        let sync = frame_sync(&noisy, sf, 0x12, 8, os_factor);
-        if sync.found {
-            let spectra = symbol_spectra(&sync.symbols, sf, os_factor as usize);
-            for spec in &spectra {
-                shared.waterfall_plot.update(spec.clone());
-            }
-            if let Some(last) = spectra.last() {
-                shared.spectrum_plot.update(last.clone());
-            }
-        } else {
-            // No sync: push a noise-floor row so the waterfall keeps scrolling.
-            let noise_row: Vec<[f64; 2]> = (0..n_sps)
-                .map(|i| [i as f64, -80.0 + rng.random::<f32>() as f64 * 10.0])
-                .collect();
-            shared.waterfall_plot.update(noise_row.clone());
-            shared.spectrum_plot.update(noise_row);
+        // Raw spectrum of the whole burst — always works, no sync required.
+        let spectra = raw_spectra(&noisy, fft_size);
+        for spec in &spectra {
+            shared.waterfall_plot.update(spec.clone());
         }
-        shared.waterfall_plot.set_freq(n_sps as f64 / 2.0);
-        shared.waterfall_plot.set_bw(n_sps as f64);
+        if let Some(last) = spectra.last() {
+            shared.spectrum_plot.update(last.clone());
+        }
+        shared.waterfall_plot.set_freq(fft_size as f64 / 2.0);
+        shared.waterfall_plot.set_bw(fft_size as f64);
 
-        // Decode and record.
+        // RX — for stats only, decoupled from the display.
         let result = rx_packet(&noisy, sf, 4, os_factor);
         {
             let mut s = shared.stats.lock().unwrap();
@@ -240,35 +213,34 @@ struct GuiApp {
     spectrum_chart:  Chart,
     waterfall_chart: Chart,
     thread_started:  bool,
-    // local copies bound to sliders / selectors
     snr_db:      f32,
     interval_ms: u64,
     sf:          u8,
     os_factor:   u32,
+    fft_size:    usize,
 }
 
 impl GuiApp {
     fn new(sf: u8, snr_db: f32) -> Self {
         let os_factor = 1u32;
-        let n         = 1usize << sf;
-        let n_sps     = n * os_factor as usize;
+        let fft_size  = 256usize;
 
-        let init_spec: Vec<[f64; 2]> = (0..n_sps).map(|i| [i as f64, -80.0]).collect();
+        let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
 
-        let spectrum_plot  = SpectrumPlot::new("Dechirped FFT", init_spec.clone(), -80.0, 80.0);
-        let waterfall_plot = WaterfallPlot::new("Waterfall",    init_spec,         -80.0);
-        waterfall_plot.set_freq(n_sps as f64 / 2.0);
-        waterfall_plot.set_bw(n_sps as f64);
+        let spectrum_plot  = SpectrumPlot::new("Spectrum",   init_spec.clone(), -80.0, 80.0);
+        let waterfall_plot = WaterfallPlot::new("Waterfall", init_spec,         -80.0);
+        waterfall_plot.set_freq(fft_size as f64 / 2.0);
+        waterfall_plot.set_bw(fft_size as f64);
 
         let mut spectrum_chart = Chart::new("spectrum");
-        spectrum_chart.set_x_limits([0.0, n_sps as f64]);
+        spectrum_chart.set_x_limits([0.0, fft_size as f64]);
         spectrum_chart.set_y_limits([-90.0, 50.0]);
         spectrum_chart.set_link_axis("lora_link", true, false);
         spectrum_chart.set_link_cursor("lora_link", true, false);
         spectrum_chart.add(spectrum_plot.clone());
 
         let mut waterfall_chart = Chart::new("waterfall");
-        waterfall_chart.set_x_limits([0.0, n_sps as f64]);
+        waterfall_chart.set_x_limits([0.0, fft_size as f64]);
         waterfall_chart.set_y_limits([0.0, 1.0]);
         waterfall_chart.set_link_axis("lora_link", true, false);
         waterfall_chart.set_link_cursor("lora_link", true, false);
@@ -278,6 +250,7 @@ impl GuiApp {
             running:        AtomicBool::new(true),
             sf:             Mutex::new(sf),
             os_factor:      Mutex::new(os_factor),
+            fft_size:       Mutex::new(fft_size),
             snr_db:         Mutex::new(snr_db),
             interval_ms:    Mutex::new(250),
             spectrum_plot,
@@ -294,18 +267,18 @@ impl GuiApp {
             interval_ms: 250,
             sf,
             os_factor,
+            fft_size,
         }
     }
 
     fn rebuild_plots(&mut self) {
-        let n     = 1usize << self.sf;
-        let n_sps = n * self.os_factor as usize;
-        self.spectrum_chart.set_x_limits([0.0, n_sps as f64]);
-        self.waterfall_chart.set_x_limits([0.0, n_sps as f64]);
+        self.spectrum_chart.set_x_limits([0.0, self.fft_size as f64]);
+        self.waterfall_chart.set_x_limits([0.0, self.fft_size as f64]);
         *self.shared.sf.lock().unwrap()        = self.sf;
         *self.shared.os_factor.lock().unwrap() = self.os_factor;
-        self.shared.waterfall_plot.set_freq(n_sps as f64 / 2.0);
-        self.shared.waterfall_plot.set_bw(n_sps as f64);
+        *self.shared.fft_size.lock().unwrap()  = self.fft_size;
+        self.shared.waterfall_plot.set_freq(self.fft_size as f64 / 2.0);
+        self.shared.waterfall_plot.set_bw(self.fft_size as f64);
         *self.shared.stats.lock().unwrap() = Stats::default();
     }
 }
@@ -352,6 +325,19 @@ impl eframe::App for GuiApp {
                         && self.os_factor != os
                     {
                         self.os_factor = os;
+                        changed = true;
+                    }
+                }
+
+                ui.separator();
+
+                // FFT size selector
+                ui.label("FFT:");
+                for &sz in &[64usize, 128, 256, 512, 1024] {
+                    if ui.selectable_label(self.fft_size == sz, format!("{sz}")).clicked()
+                        && self.fft_size != sz
+                    {
+                        self.fft_size = sz;
                         changed = true;
                     }
                 }
