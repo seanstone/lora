@@ -14,7 +14,7 @@ use lora::rx::{
     hamming_dec::hamming_dec, header_decoder::decode_header,
     crc_verif::verify_crc, dewhitening::dewhiten,
 };
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rustfft::num_complex::Complex;
 use std::time::{Duration, Instant};
 
@@ -22,10 +22,9 @@ use std::time::{Duration, Instant};
 
 /// Box-Muller: unit-normal sample using two uniform draws.
 fn randn(rng: &mut impl Rng) -> f32 {
-    // `gen` is a reserved keyword in edition 2024; use r#gen to escape it.
-    let u1 = (rng.r#gen::<f32>() + 1e-7_f32).min(1.0);
-    let u2 = rng.r#gen::<f32>();
-    (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    let u1 = (rng.random::<f32>() + 1e-7_f32).min(1.0);
+    let u2 = rng.random::<f32>();
+    (-2.0_f32 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
 /// Add complex AWGN at the given per-sample SNR.
@@ -144,7 +143,7 @@ fn main() {
         b"packet!",
     ];
 
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     let mut ok  = 0_usize;
     let interval = Duration::from_millis(interval_ms);
 

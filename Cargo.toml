@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rustfft = "6"
-rand    = { version = "0.8", features = ["small_rng"] }
+rustfft = "6.4.1"
+rand    = { version = "0.10.0", features = ["std_rng"] }
