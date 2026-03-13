@@ -655,25 +655,6 @@ impl eframe::App for GuiApp {
                 });
             });
 
-            // ── Row 3: stats ──────────────────────────────────────────────────
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("↺ Reset stats").clicked() {
-                    *self.shared.stats.lock().unwrap() = Stats::default();
-                    self.shared.log.lock().unwrap().clear();
-                }
-
-                ui.separator();
-
-                let per = if stats.total > 0 {
-                    100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
-                } else { 0.0 };
-                ui.label(format!(
-                    "TX: {:12}  RX: {:12}  {}/{} ok  PER {:.0}%",
-                    format!("{:?}", stats.last_tx),
-                    format!("{:?}", stats.last_rx),
-                    stats.ok, stats.total, per,
-                ));
-            });
         });
 
         egui::SidePanel::right("msg_log")
@@ -682,6 +663,24 @@ impl eframe::App for GuiApp {
             .show(ctx, |ui| {
                 ui.heading("Messages");
                 ui.separator();
+
+                // ── Stats + reset ─────────────────────────────────────────────
+                let per = if stats.total > 0 {
+                    100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
+                } else { 0.0 };
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}/{} ok", stats.ok, stats.total));
+                    ui.label(format!("PER {:.0}%", per));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("↺ Reset").clicked() {
+                            *self.shared.stats.lock().unwrap() = Stats::default();
+                            self.shared.log.lock().unwrap().clear();
+                        }
+                    });
+                });
+                ui.separator();
+
+                // ── Scrolling message log ─────────────────────────────────────
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
