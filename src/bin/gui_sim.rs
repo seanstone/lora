@@ -43,6 +43,14 @@ use std::{
 const SR_OPTIONS_KHZ: &[u32] = &[125, 250, 500, 1000, 2000, 4000];
 const BW_OPTIONS_KHZ: &[u32] = &[125, 250, 500, 1000];
 
+const DEFAULT_SF:           u8    = 7;
+const DEFAULT_SAMP_RATE_KHZ: u32  = 1000;
+const DEFAULT_BW_KHZ:        u32  = 250;
+const DEFAULT_FFT_SIZE:      usize = 1024;
+const DEFAULT_SIGNAL_DB:     f32   = -20.0;
+const DEFAULT_NOISE_DB:      f32   = -35.0;
+const DEFAULT_INTERVAL_MS:   u64   = 500;
+
 /// Tick interval for the stream thread (~60 fps waterfall scroll).
 const TICK: Duration = Duration::from_millis(16);
 
@@ -383,12 +391,12 @@ struct GuiApp {
 
 impl GuiApp {
     fn new(sf: u8) -> Self {
-        let samp_rate_khz = 1000u32;
-        let bw_khz        = 250u32;
+        let samp_rate_khz  = DEFAULT_SAMP_RATE_KHZ;
+        let bw_khz         = DEFAULT_BW_KHZ;
         let (_, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
-        let fft_size      = 1024usize;
-        let signal_db     = -20.0f32;  // typical received signal well below full scale
-        let noise_db      = -35.0f32;  // SNR = 15 dB — good outdoor link, noise visible
+        let fft_size       = DEFAULT_FFT_SIZE;
+        let signal_db      = DEFAULT_SIGNAL_DB;
+        let noise_db       = DEFAULT_NOISE_DB;
 
         let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
 
@@ -419,7 +427,7 @@ impl GuiApp {
             fft_size:       Mutex::new(fft_size),
             signal_db:      Mutex::new(signal_db),
             noise_db:       Mutex::new(noise_db),
-            interval_ms:    Mutex::new(500),
+            interval_ms:    Mutex::new(DEFAULT_INTERVAL_MS),
             spectrum_plot,
             waterfall_plot,
             stats:          Mutex::new(Stats::default()),
@@ -432,12 +440,26 @@ impl GuiApp {
             thread_started: false,
             signal_db,
             noise_db,
-            interval_ms: 500,
+            interval_ms: DEFAULT_INTERVAL_MS,
             sf,
             samp_rate_khz,
             bw_khz,
             fft_size,
         }
+    }
+
+    fn restore_defaults(&mut self) {
+        self.sf            = DEFAULT_SF;
+        self.samp_rate_khz = DEFAULT_SAMP_RATE_KHZ;
+        self.bw_khz        = DEFAULT_BW_KHZ;
+        self.fft_size      = DEFAULT_FFT_SIZE;
+        self.signal_db     = DEFAULT_SIGNAL_DB;
+        self.noise_db      = DEFAULT_NOISE_DB;
+        self.interval_ms   = DEFAULT_INTERVAL_MS;
+        *self.shared.signal_db.lock().unwrap()   = self.signal_db;
+        *self.shared.noise_db.lock().unwrap()    = self.noise_db;
+        *self.shared.interval_ms.lock().unwrap() = self.interval_ms;
+        self.rebuild_plots();
     }
 
     fn rebuild_plots(&mut self) {
@@ -553,6 +575,12 @@ impl eframe::App for GuiApp {
                 });
 
                 if changed { self.rebuild_plots(); }
+
+                ui.separator();
+
+                if ui.button("⟳ Defaults").clicked() {
+                    self.restore_defaults();
+                }
             });
 
             // ── Row 2: levels + interval ──────────────────────────────────────
@@ -601,6 +629,12 @@ impl eframe::App for GuiApp {
 
             // ── Row 3: stats ──────────────────────────────────────────────────
             ui.horizontal_wrapped(|ui| {
+                if ui.button("↺ Reset stats").clicked() {
+                    *self.shared.stats.lock().unwrap() = Stats::default();
+                }
+
+                ui.separator();
+
                 let per = if stats.total > 0 {
                     100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
                 } else { 0.0 };
