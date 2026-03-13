@@ -231,6 +231,7 @@ struct SimShared {
     spectrum_plot:  Arc<SpectrumPlot>,
     waterfall_plot: Arc<WaterfallPlot>,
     stats:          Mutex<Stats>,
+    log:            Mutex<VecDeque<LogEntry>>,
 }
 
 #[derive(Default, Clone)]
@@ -240,6 +241,14 @@ struct Stats {
     last_tx: String,
     last_rx: String,
 }
+
+#[derive(Clone)]
+struct LogEntry {
+    ok:      bool,
+    payload: String,
+}
+
+const MAX_LOG_ENTRIES: usize = 200;
 
 // ─── Sim thread ───────────────────────────────────────────────────────────────
 
@@ -343,6 +352,22 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
                     s.last_rx = "—".to_string();
                 }
             }
+            {
+                let ok = result.as_deref() == Some(payload);
+                let entry = LogEntry {
+                    ok,
+                    payload: if ok {
+                        String::from_utf8_lossy(payload).to_string()
+                    } else {
+                        result.as_ref()
+                            .map(|p| format!("ERR: {}", String::from_utf8_lossy(p)))
+                            .unwrap_or_else(|| "LOST".to_string())
+                    },
+                };
+                let mut log = shared.log.lock().unwrap();
+                log.push_back(entry);
+                if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
+            }
         }
 
         // ── Channel → display: drain up to MAX_ROWS_PER_TICK FFT windows ─
@@ -431,6 +456,7 @@ impl GuiApp {
             spectrum_plot,
             waterfall_plot,
             stats:          Mutex::new(Stats::default()),
+            log:            Mutex::new(VecDeque::new()),
         });
 
         Self {
@@ -473,6 +499,7 @@ impl GuiApp {
         self.shared.waterfall_plot.set_freq(self.fft_size as f64 / 2.0);
         self.shared.waterfall_plot.set_bw(self.fft_size as f64);
         *self.shared.stats.lock().unwrap() = Stats::default();
+        self.shared.log.lock().unwrap().clear();
         self.shared.clear_buf.store(true, Ordering::Relaxed);
     }
 }
@@ -510,6 +537,7 @@ impl eframe::App for GuiApp {
 
         let running = self.shared.running.load(Ordering::Relaxed);
         let stats   = self.shared.stats.lock().unwrap().clone();
+        let log     = self.shared.log.lock().unwrap().clone();
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             // ── Row 1: signal parameters ──────────────────────────────────────
@@ -631,6 +659,7 @@ impl eframe::App for GuiApp {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("↺ Reset stats").clicked() {
                     *self.shared.stats.lock().unwrap() = Stats::default();
+                    self.shared.log.lock().unwrap().clear();
                 }
 
                 ui.separator();
@@ -646,6 +675,30 @@ impl eframe::App for GuiApp {
                 ));
             });
         });
+
+        egui::SidePanel::right("msg_log")
+            .min_width(200.0)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                ui.heading("Messages");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in &log {
+                            ui.horizontal(|ui| {
+                                let (dot, color) = if entry.ok {
+                                    ("●", egui::Color32::from_rgb(80, 200, 80))
+                                } else {
+                                    ("●", egui::Color32::from_rgb(220, 60, 60))
+                                };
+                                ui.colored_label(color, dot);
+                                ui.label(&entry.payload);
+                            });
+                        }
+                    });
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let h = ui.available_height();
