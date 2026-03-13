@@ -2,11 +2,8 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::f64::consts::TAU;
 
 pub struct FrameSyncResult {
-    pub found:          bool,
-    pub symbols:        Vec<Complex<f32>>,
-    /// Sample index in the input buffer where the preamble starts.
-    /// Only valid when `found == true`.
-    pub preamble_start: usize,
+    pub found:   bool,
+    pub symbols: Vec<Complex<f32>>,
 }
 
 fn make_downchirp(sf: u8) -> Vec<Complex<f32>> {
@@ -79,9 +76,8 @@ pub fn frame_sync(
                 if payload_start + sps <= samples.len() {
                     let len = ((samples.len() - payload_start) / sps) * sps;
                     return FrameSyncResult {
-                        found:          true,
-                        symbols:        samples[payload_start..payload_start + len].to_vec(),
-                        preamble_start,
+                        found:   true,
+                        symbols: samples[payload_start..payload_start + len].to_vec(),
                     };
                 }
                 break;
@@ -92,5 +88,5 @@ pub fn frame_sync(
         w += sps;
     }
 
-    FrameSyncResult { found: false, symbols: vec![], preamble_start: 0 }
+    FrameSyncResult { found: false, symbols: vec![] }
 }

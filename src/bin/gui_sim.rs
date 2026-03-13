@@ -109,104 +109,48 @@ fn pad_nibbles(nibbles: &[u8], sf: u8, ldro: bool) -> Vec<u8> {
 
 // ─── Channel ──────────────────────────────────────────────────────────────────
 
-/// A block produced by the TX modem and queued into the channel.
-/// Silence is an explicit block so the scheduler doesn't need to pre-generate
-/// AWGN; noise is mixed at `read()` time using the *current* settings.
-enum TxBlock {
-    /// Clean unit-amplitude chirp IQ from the TX modem.
-    Packet(Vec<Complex<f32>>),
-    /// N samples of silence — becomes pure AWGN in the channel output.
-    Silence(usize),
-}
-
-/// Simulated AWGN channel.  TX blocks are queued and consumed in order;
-/// `signal_amp` and `noise_sigma` are applied at `read()` time so any
-/// settings change takes effect within the very next FFT window.
+/// Free-running AWGN channel.  Silence and TX bursts are both pushed as
+/// explicit IQ samples; `read()` just drains the pre-filled queue.
 ///
-/// In SDR / file mode: swap `push` + `read` for driver calls; the TX and RX
-/// structs stay unchanged.
+/// Future device mode: replace `push_silence` / `inject` / `read` with SDR
+/// driver calls.
 struct Channel {
-    queue:       VecDeque<TxBlock>,
-    cur_pkt:     Option<Vec<Complex<f32>>>,
-    cur_off:     usize,
-    sil_rem:     usize,
-    signal_amp:  f32,
     noise_sigma: f32,
-    samples_read: u64,  // total samples output; used for display-lag tracking
+    pending:     VecDeque<Complex<f32>>,
 }
 
 impl Channel {
-    fn new(signal_amp: f32, noise_sigma: f32) -> Self {
-        Self {
-            queue: VecDeque::new(), cur_pkt: None, cur_off: 0, sil_rem: 0,
-            signal_amp, noise_sigma, samples_read: 0,
-        }
+    fn new(noise_sigma: f32) -> Self {
+        Self { noise_sigma, pending: VecDeque::new() }
     }
 
-    fn push(&mut self, block: TxBlock) { self.queue.push_back(block); }
+    fn set_noise_sigma(&mut self, s: f32) { self.noise_sigma = s; }
+    fn pending_len(&self) -> usize        { self.pending.len() }
+    fn clear(&mut self)                   { self.pending.clear(); }
 
-    fn clear(&mut self) {
-        self.queue.clear();
-        self.cur_pkt = None;
-        self.cur_off = 0;
-        self.sil_rem = 0;
+    /// Push pre-built mixed IQ directly into the stream (no per-sample work).
+    fn push_prebuilt(&mut self, samples: &[Complex<f32>]) {
+        self.pending.extend(samples.iter().copied());
     }
 
-    /// Samples queued but not yet read (= display lag in samples).
-    fn queued_samples(&self) -> usize {
-        let cur = self.sil_rem
-            + self.cur_pkt.as_ref().map_or(0, |p| p.len() - self.cur_off);
-        cur + self.queue.iter().map(|b| match b {
-            TxBlock::Packet(v) => v.len(),
-            TxBlock::Silence(n) => *n,
-        }).sum::<usize>()
+    /// Push `n` samples of pure AWGN (silence / inter-packet gap) into the stream.
+    fn push_silence(&mut self, n: usize, rng: &mut impl Rng) {
+        for _ in 0..n { self.pending.push_back(self.noise_sample(rng)); }
     }
 
-    /// Read `n` mixed samples.  Signal and AWGN levels use the *current*
-    /// `signal_amp` / `noise_sigma` — changes apply immediately.
+    /// Drain `n` samples from the stream, synthesising pure AWGN for any
+    /// sample that has no pending signal.
     fn read(&mut self, n: usize, rng: &mut impl Rng) -> Vec<Complex<f32>> {
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
-            if self.sil_rem > 0 {
-                let k = (n - out.len()).min(self.sil_rem);
-                for _ in 0..k {
-                    out.push(Complex::new(
-                        box_muller(rng) * self.noise_sigma,
-                        box_muller(rng) * self.noise_sigma,
-                    ));
-                }
-                self.sil_rem -= k;
-            } else if self.cur_pkt.is_some() {
-                let pkt_len = self.cur_pkt.as_ref().unwrap().len();
-                let off = self.cur_off;
-                let k   = (n - out.len()).min(pkt_len - off);
-                let amp = self.signal_amp;
-                let ns  = self.noise_sigma;
-                for i in 0..k {
-                    let s = self.cur_pkt.as_ref().unwrap()[off + i] * amp;
-                    out.push(s + Complex::new(
-                        box_muller(rng) * ns,
-                        box_muller(rng) * ns,
-                    ));
-                }
-                self.cur_off += k;
-                if self.cur_off >= pkt_len { self.cur_pkt = None; }
-            } else {
-                match self.queue.pop_front() {
-                    Some(TxBlock::Silence(n)) => { self.sil_rem  = n; }
-                    Some(TxBlock::Packet(v))  => { self.cur_pkt = Some(v); self.cur_off = 0; }
-                    None => {
-                        // Underflow: synthesise pure noise.
-                        out.push(Complex::new(
-                            box_muller(rng) * self.noise_sigma,
-                            box_muller(rng) * self.noise_sigma,
-                        ));
-                    }
-                }
-            }
-        }
-        self.samples_read += n as u64;
-        out
+        (0..n)
+            .map(|_| self.pending.pop_front().unwrap_or_else(|| self.noise_sample(rng)))
+            .collect()
+    }
+
+    fn noise_sample(&self, rng: &mut impl Rng) -> Complex<f32> {
+        Complex::new(
+            box_muller(rng) * self.noise_sigma,
+            box_muller(rng) * self.noise_sigma,
+        )
     }
 }
 
@@ -228,10 +172,7 @@ struct Rx {
 impl Rx {
     fn new(sf: u8, cr: u8, os_factor: u32) -> Self { Self { sf, cr, os_factor } }
 
-    /// Returns `(payload, preamble_start)` — `preamble_start` is the sample
-    /// offset in `iq` where the preamble begins, needed to drain the rx buffer
-    /// to exactly the right position after a successful decode.
-    fn decode(&self, iq: &[Complex<f32>]) -> Option<(Vec<u8>, usize)> {
+    fn decode(&self, iq: &[Complex<f32>]) -> Option<Vec<u8>> {
         let sync = frame_sync(iq, self.sf, 0x12, 8, self.os_factor);
         if !sync.found { return None; }
         let chirps    = fft_demod(&sync.symbols, self.sf, self.os_factor);
@@ -249,7 +190,7 @@ impl Rx {
             let crc_nib = &info.payload_nibbles[2 * pay_len..2 * pay_len + 4];
             if !verify_crc(&payload, crc_nib) { return None; }
         }
-        Some((payload, sync.preamble_start))
+        Some(payload)
     }
 }
 
@@ -278,23 +219,24 @@ fn spectrum_window(
 
 // ─── Worker threads ───────────────────────────────────────────────────────────
 
-/// TX generation request.  No noise params — the channel mixes AWGN at read time.
+/// TX generation request: the worker does modulate + AWGN mixing off-thread.
 struct TxJob {
-    sf:        u8,
-    cr:        u8,
-    os_factor: u32,
-    payload:   Vec<u8>,
+    sf:          u8,
+    cr:          u8,
+    os_factor:   u32,
+    payload:     Vec<u8>,
+    signal_amp:  f32,   // snapshot at dispatch time
+    noise_sigma: f32,
+    rng_seed:    u64,   // reproducible per-packet noise
 }
 
-/// Clean unit-amplitude packet IQ returned by the TX worker.
+/// Result returned by tx_worker: pre-built mixed IQ ready to inject.
 struct TxResult {
     payload: Vec<u8>,
-    iq:      Vec<Complex<f32>>,
+    mixed:   Vec<Complex<f32>>,
 }
 
-/// Generates clean chirp IQ off the sim_loop critical path.
-/// No noise is added here — the channel applies AWGN at `read()` time so
-/// level changes take effect immediately without pre-mixed data becoming stale.
+/// Runs TX modulation and AWGN mixing off the sim_loop critical path.
 fn tx_worker(
     jobs:    std::sync::mpsc::Receiver<TxJob>,
     results: std::sync::mpsc::SyncSender<TxResult>,
@@ -305,95 +247,64 @@ fn tx_worker(
             tx = Tx::new(job.sf, job.cr, job.os_factor);
         }
         let iq = tx.modulate(&job.payload);
-        let _ = results.send(TxResult { payload: job.payload, iq });
+        let mut rng = rand::rngs::StdRng::seed_from_u64(job.rng_seed);
+        let mixed: Vec<_> = iq.iter()
+            .map(|&s| {
+                let n = Complex::new(
+                    box_muller(&mut rng) * job.noise_sigma,
+                    box_muller(&mut rng) * job.noise_sigma,
+                );
+                s * job.signal_amp + n
+            })
+            .collect();
+        // If the channel is full the sim is shutting down; drop gracefully.
+        let _ = results.send(TxResult { payload: job.payload, mixed });
     }
 }
 
-/// Conservative lower bound on the number of IQ samples in a LoRa packet.
-/// Used to decide when the RX accumulation buffer is large enough to attempt
-/// a decode.
-fn min_pkt_samples(sf: u8, os_factor: u32, payload_len: usize) -> usize {
-    let sym = (1usize << sf as usize) * os_factor as usize;
-    // preamble(8) + SFD(2) + header(≥4) + ~2 symbols per payload byte
-    (12 + payload_len * 2 + 4) * sym
+/// Packet handed from the fill thread to the RX decode thread.
+struct RxJob {
+    sf:        u8,
+    cr:        u8,
+    os_factor: u32,
+    payload:   Vec<u8>,
+    mixed:     Vec<Complex<f32>>,
 }
 
-/// Receives the continuous mixed IQ stream produced by the channel and runs
-/// frame-sync decode.  No packet-boundary knowledge is passed from TX;
-/// `frame_sync` (called inside `Rx::decode`) finds preambles autonomously.
-///
-/// Stats matching: `pending_tx` in `SimShared` carries expected payloads in
-/// transmission order.  A successful decode pops the front entry and marks it
-/// ok; if the decoded payload doesn't match the front entry, preceding entries
-/// are emitted as LOST.  In a real SDR scenario `pending_tx` stays empty and
-/// the log shows raw decoded payloads.
-fn rx_worker(
-    stream: std::sync::mpsc::Receiver<Vec<Complex<f32>>>,
-    shared: Arc<SimShared>,
-) {
-    let mut rx  = Rx::new(7, 4, 4);
-    let mut buf: VecDeque<Complex<f32>> = VecDeque::new();
-
-    for chunk in stream {
-        let sf = *shared.sf.lock().unwrap();
-        let os = *shared.os_factor.lock().unwrap();
-        if sf != rx.sf || os != rx.os_factor {
-            rx  = Rx::new(sf, 4, os);
-            buf.clear();
+/// Decodes incoming packets off the critical path and updates stats / log.
+fn rx_worker(jobs: std::sync::mpsc::Receiver<RxJob>, shared: Arc<SimShared>) {
+    let mut rx = Rx::new(7, 4, 4);
+    while let Ok(job) = jobs.recv() {
+        if job.sf != rx.sf || job.os_factor != rx.os_factor {
+            rx = Rx::new(job.sf, job.cr, job.os_factor);
         }
-        buf.extend(&chunk);
-
-        let sym     = (1usize << sf as usize) * os as usize;
-        let min_win = min_pkt_samples(sf, os, 1);
-        if buf.len() < min_win { continue; }
-
-        let window: Vec<_> = buf.iter().copied().collect();
-        match rx.decode(&window) {
-            Some((decoded, preamble_start)) => {
-                let decoded_str = String::from_utf8_lossy(&decoded).to_string();
-
-                // Match against the TX metadata queue for accurate PER / log.
-                let mut pending = shared.pending_tx.lock().unwrap();
-                let match_pos   = pending.iter().position(|p| p == &decoded);
-
-                // Entries before the match (if any) were never received — LOST.
-                let lost_count = match_pos.unwrap_or(0);
-                let lost_entries: Vec<_> = pending.drain(..lost_count).collect();
-                for lost in lost_entries {
-                    {
-                        let mut log = shared.log.lock().unwrap();
-                        log.push_back(LogEntry {
-                            ok: false,
-                            payload: format!("LOST: {}", String::from_utf8_lossy(&lost)),
-                        });
-                        if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
-                    }
-                }
-                let ok = !pending.is_empty() && pending.front().map(|p| p == &decoded).unwrap_or(false);
-                if !pending.is_empty() { pending.pop_front(); }  // consume matched entry
-
-                { let mut s = shared.stats.lock().unwrap(); if ok { s.ok += 1; } s.last_rx = decoded_str.clone(); }
-                {
-                    let mut log = shared.log.lock().unwrap();
-                    log.push_back(LogEntry {
-                        ok,
-                        payload: if ok { decoded_str } else { format!("ERR: {decoded_str}") },
-                    });
-                    if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
-                }
-
-                // Drain silence-before-packet + the packet itself so we don't
-                // re-decode the same packet on the next iteration.
-                let skip = (preamble_start + min_pkt_samples(sf, os, decoded.len()))
-                    .min(buf.len());
-                buf.drain(..skip);
+        let result = rx.decode(&job.mixed);
+        {
+            let mut s = shared.stats.lock().unwrap();
+            s.total += 1;
+            s.last_tx = String::from_utf8_lossy(&job.payload).to_string();
+            if let Some(ref rx_payload) = result {
+                if *rx_payload == job.payload { s.ok += 1; }
+                s.last_rx = String::from_utf8_lossy(rx_payload).to_string();
+            } else {
+                s.last_rx = "—".to_string();
             }
-            None => {
-                // frame_sync found nothing in this window; keep a preamble-length
-                // overlap so a packet straddling the trim boundary isn't missed.
-                let keep = sym * 10;
-                if buf.len() > keep { buf.drain(..buf.len() - keep); }
-            }
+        }
+        {
+            let ok = result.as_deref() == Some(job.payload.as_slice());
+            let entry = LogEntry {
+                ok,
+                payload: if ok {
+                    String::from_utf8_lossy(&job.payload).to_string()
+                } else {
+                    result.as_ref()
+                        .map(|p| format!("ERR: {}", String::from_utf8_lossy(p)))
+                        .unwrap_or_else(|| "LOST".to_string())
+                },
+            };
+            let mut log = shared.log.lock().unwrap();
+            log.push_back(entry);
+            if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
         }
     }
 }
@@ -441,8 +352,6 @@ struct SimShared {
     waterfall_plot: Arc<WaterfallPlot>,
     stats:          Mutex<Stats>,
     log:            Mutex<VecDeque<LogEntry>>,
-    /// TX payloads in transmission order; RX pops on successful decode.
-    pending_tx:     Mutex<VecDeque<Vec<u8>>>,
     /// Display-buffer lag in ms (f32 bits stored in AtomicU32 for lock-free reads).
     buf_lag_ms:     AtomicU32,
     buf_overflow:   AtomicBool,
@@ -467,7 +376,7 @@ const MAX_LOG_ENTRIES: usize = 200;
 
 // ─── Sim thread ───────────────────────────────────────────────────────────────
 
-fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
+fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x10_4a);
     let payloads: &[&[u8]] = &[
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
@@ -475,41 +384,46 @@ fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     ];
     let mut idx = 0usize;
 
-    // Virtual sample clock: tracks how many samples have been scheduled into
-    // the channel queue.  Actual audio/SDR output happens at `channel.read()`.
+    // Virtual sample clock.
     let mut filled_samples:   u64 = 0;
     let mut next_packet_at:   u64 = 0;
     let mut last_interval_ms: u64 = u64::MAX;
-    let mut tx_inflight = false;
+    let mut tx_inflight  = false;
+    // Packet samples not yet pushed to channel.pending; drained one tick at a time
+    // to keep the display buffer shallow and settings changes near-instant.
+    let mut tx_remainder: std::collections::VecDeque<Complex<f32>> = std::collections::VecDeque::new();
 
     // Spawn worker threads.
-    // iq_send → rx_worker: continuous mixed IQ stream (no packet-boundary info).
-    let (iq_send,   iq_recv)   = std::sync::mpsc::channel::<Vec<Complex<f32>>>();
+    let (rx_send,   rx_recv)   = std::sync::mpsc::channel::<RxJob>();
     let (disp_send, disp_recv) = std::sync::mpsc::channel::<DisplayJob>();
     // sync_channel(1): tx_worker stays at most one packet ahead.
     let (tx_job_send, tx_job_recv) = std::sync::mpsc::channel::<TxJob>();
     let (tx_res_send, tx_res_recv) = std::sync::mpsc::sync_channel::<TxResult>(1);
-    { let s = shared.clone(); std::thread::spawn(move || rx_worker(iq_recv, s)); }
+    { let s = shared.clone(); std::thread::spawn(move || rx_worker(rx_recv, s)); }
     { let s = shared.clone(); std::thread::spawn(move || display_worker(disp_recv, s)); }
     std::thread::spawn(move || tx_worker(tx_job_recv, tx_res_send));
 
-    let init_signal_db = *shared.signal_db.lock().unwrap();
-    let init_noise_db  = *shared.noise_db.lock().unwrap();
+    let init_noise_db = *shared.noise_db.lock().unwrap();
     let mut channel = Channel::new(
-        db_to_amp(init_signal_db),
         db_to_amp(init_noise_db) / std::f32::consts::SQRT_2,
     );
 
     // Helper: dispatch the next TX job to the worker thread.
-    // Only sf, cr, os_factor, payload — no noise; channel applies AWGN at read().
     macro_rules! dispatch_tx {
-        ($sf:expr, $os:expr) => {{
+        ($sf:expr, $os:expr, $sig:expr, $ns:expr) => {{
             let payload = payloads[idx % payloads.len()].to_vec();
             idx += 1;
-            let _ = tx_job_send.send(TxJob { sf: $sf, cr: 4, os_factor: $os, payload });
+            let _ = tx_job_send.send(TxJob {
+                sf: $sf, cr: 4, os_factor: $os,
+                payload,
+                signal_amp:  $sig,
+                noise_sigma: $ns,
+                rng_seed:    rng.random(),
+            });
             tx_inflight = true;
         }};
     }
+
 
     loop {
         let tick_start = Instant::now();
@@ -522,10 +436,11 @@ fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         // Flush channel on settings change; reset virtual clock.
         if shared.clear_buf.swap(false, Ordering::Relaxed) {
             channel.clear();
-            shared.pending_tx.lock().unwrap().clear();
+            tx_remainder.clear();
             filled_samples   = 0;
             next_packet_at   = 0;
             last_interval_ms = u64::MAX;
+            // Drain any stale result and dispatch a fresh job with new settings.
             while tx_res_recv.try_recv().is_ok() {}
             tx_inflight = false;
         }
@@ -541,10 +456,8 @@ fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
         let signal_amp  = db_to_amp(signal_db);
         let noise_sigma = db_to_amp(noise_db) / std::f32::consts::SQRT_2;
 
-        // Update channel levels; applied per-sample at channel.read() time so
-        // any settings change takes effect on the very next FFT window.
-        channel.signal_amp  = signal_amp;
-        channel.noise_sigma = noise_sigma;
+        // push_silence still uses the channel's noise settings.
+        channel.set_noise_sigma(noise_sigma);
 
         // ── TX: sample-accurate fill ──────────────────────────────────────
         let samp_rate_hz     = samp_rate_khz as u64 * 1000;
@@ -556,77 +469,87 @@ fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
             next_packet_at   = filled_samples;
         }
 
-        // Keep the worker busy; it stays at most one packet ahead.
+        // Ensure a job is always in flight so the worker stays busy.
         if !tx_inflight {
-            dispatch_tx!(sf, os_factor);
+            dispatch_tx!(sf, os_factor, signal_amp, noise_sigma);
         }
 
         let target = filled_samples + samples_per_tick;
 
         while filled_samples < target {
+            // Phase 1: trickle leftover packet samples (one tick's worth at a time).
+            if !tx_remainder.is_empty() {
+                let n = (target - filled_samples).min(tx_remainder.len() as u64) as usize;
+                // drain n items from the front into a temporary slice
+                let batch: Vec<_> = (0..n).map(|_| tx_remainder.pop_front().unwrap()).collect();
+                channel.push_prebuilt(&batch);
+                filled_samples += n as u64;
+                continue;
+            }
+
             if next_packet_at <= filled_samples {
-                // Time for the next packet — collect from worker or fill silence.
+                // Try to collect the pre-built packet; fill silence if not ready yet.
                 match tx_res_recv.try_recv() {
                     Ok(res) => {
-                        let pkt_len = res.iq.len() as u64;
-                        // Schedule gap after this packet.
+                        let pkt_len = res.mixed.len() as u64;
+                        // Fix next_packet_at BEFORE modifying filled_samples.
                         next_packet_at = filled_samples + pkt_len + interval_samples;
-                        filled_samples += pkt_len;
 
-                        // Register in pending_tx for RX matching and update stats.
-                        shared.pending_tx.lock().unwrap().push_back(res.payload.clone());
-                        {
-                            let mut s = shared.stats.lock().unwrap();
-                            s.total  += 1;
-                            s.last_tx = String::from_utf8_lossy(&res.payload).to_string();
+                        // Push the first chunk this tick; rest goes to trickle buffer.
+                        let first_n = (target - filled_samples).min(pkt_len) as usize;
+                        channel.push_prebuilt(&res.mixed[..first_n]);
+                        filled_samples += first_n as u64;
+                        if first_n < res.mixed.len() {
+                            tx_remainder.extend(res.mixed[first_n..].iter().copied());
                         }
 
-                        // Push clean IQ into the channel; AWGN mixed at read() time.
-                        channel.push(TxBlock::Packet(res.iq));
-
-                        // Pre-build the next packet while this one is being drained.
-                        dispatch_tx!(sf, os_factor);
+                        // Hand full mixed IQ to RX thread and pre-build the next packet.
+                        let _ = rx_send.send(RxJob {
+                            sf, cr: 4, os_factor,
+                            payload: res.payload,
+                            mixed:   res.mixed,
+                        });
+                        dispatch_tx!(sf, os_factor, signal_amp, noise_sigma);
                     }
                     Err(_) => {
-                        // Worker still generating; fill remaining tick with silence.
+                        // Worker still generating; fill this tick with silence.
                         let n = (target - filled_samples) as usize;
-                        channel.push(TxBlock::Silence(n));
+                        channel.push_silence(n, &mut rng);
                         filled_samples = target;
                     }
                 }
             } else {
-                // Still in the inter-packet silence gap.
                 let silence_end = next_packet_at.min(target);
                 let n = (silence_end - filled_samples) as usize;
-                channel.push(TxBlock::Silence(n));
+                channel.push_silence(n, &mut rng);
                 filled_samples += n as u64;
             }
         }
 
-        // ── Channel → display + RX threads: drain one tick's worth ───────
+        // ── Channel → display thread: drain one tick's worth of FFT rows ─
         let target_rows = (samples_per_tick as usize / fft_size).max(1).min(MAX_ROWS_PER_TICK);
-        let avail_rows  = channel.queued_samples() / fft_size;
-        let rows        = target_rows.min(avail_rows.max(1)); // always ≥1 (underflow → noise)
+        let avail_rows  = channel.pending_len() / fft_size;
+        let rows        = target_rows.min(avail_rows.max(1)); // always at least 1 (noise fallback)
 
         for i in 0..rows {
             let window = channel.read(fft_size, &mut rng);
-            let _ = iq_send.send(window.clone());
             let _ = disp_send.send((window, i + 1 == rows));
         }
 
         // ── Buffer status ─────────────────────────────────────────────────
-        let queued    = channel.queued_samples();
-        let lag_ms    = queued as f32 * 1000.0 / samp_rate_hz as f32;
-        let overflow  = avail_rows > target_rows * 8;
-        let underflow = avail_rows == 0;
-        shared.buf_lag_ms   .store(lag_ms.to_bits(), Ordering::Relaxed);
-        shared.buf_overflow .store(overflow,          Ordering::Relaxed);
-        shared.buf_underflow.store(underflow,         Ordering::Relaxed);
+        // Total unplayed samples = pending + trickle remainder.
+        let unplayed   = channel.pending_len() + tx_remainder.len();
+        let lag_ms     = unplayed as f32 * 1000.0 / samp_rate_hz as f32;
+        let overflow   = avail_rows > target_rows * 8; // >8× a tick's worth backed up
+        let underflow  = avail_rows == 0;
+        shared.buf_lag_ms   .store(lag_ms.to_bits(),         Ordering::Relaxed);
+        shared.buf_overflow .store(overflow,                  Ordering::Relaxed);
+        shared.buf_underflow.store(underflow,                 Ordering::Relaxed);
 
         shared.waterfall_plot.set_freq(fft_size as f64 / 2.0);
         shared.waterfall_plot.set_bw(fft_size as f64);
 
-        if let Some(ref ctx) = ctx { ctx.request_repaint(); }
+        ctx.request_repaint();
 
         let elapsed = tick_start.elapsed();
         if elapsed < TICK { std::thread::sleep(TICK - elapsed); }
@@ -695,7 +618,6 @@ impl GuiApp {
             waterfall_plot,
             stats:          Mutex::new(Stats::default()),
             log:            Mutex::new(VecDeque::new()),
-            pending_tx:     Mutex::new(VecDeque::new()),
             buf_lag_ms:     AtomicU32::new(0),
             buf_overflow:   AtomicBool::new(false),
             buf_underflow:  AtomicBool::new(false),
@@ -775,7 +697,7 @@ impl eframe::App for GuiApp {
             self.thread_started = true;
             let shared = self.shared.clone();
             let ctx2   = ctx.clone();
-            std::thread::spawn(move || sim_loop(shared, Some(ctx2)));
+            std::thread::spawn(move || sim_loop(shared, ctx2));
         }
 
         let running = self.shared.running.load(Ordering::Relaxed);
@@ -971,7 +893,10 @@ impl eframe::App for GuiApp {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-fn run_gui(sf: u8) {
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let sf = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7_u8);
+
     eframe::run_native(
         "LoRa Link Simulator",
         eframe::NativeOptions {
@@ -982,42 +907,4 @@ fn run_gui(sf: u8) {
         },
         Box::new(move |_cc| Ok(Box::new(GuiApp::new(sf)))),
     ).unwrap();
-}
-
-fn run_cli(sf: u8) {
-    let app    = GuiApp::new(sf);
-    let shared = app.shared.clone();
-    std::thread::spawn(move || sim_loop(shared, None));
-
-    println!("LoRa CLI simulator  SF={sf}  SR={}kHz  BW={}kHz",
-        DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ);
-    println!("{:<8} {:<8} {:<8} {:<8}  last_rx",
-        "total", "ok", "PER%", "lag_ms");
-
-    let mut last_total = 0usize;
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-        let stats   = app.shared.stats.lock().unwrap().clone();
-        let lag_ms  = f32::from_bits(app.shared.buf_lag_ms.load(Ordering::Relaxed));
-        let per     = if stats.total > 0 {
-            100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
-        } else { 0.0 };
-        if stats.total != last_total {
-            last_total = stats.total;
-            println!("{:<8} {:<8} {:<8.1} {:<8.0}  {}",
-                stats.total, stats.ok, per, lag_ms, stats.last_rx);
-        }
-    }
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let cli = args.iter().any(|a| a == "--cli");
-    let sf  = args.iter()
-        .filter(|a| !a.starts_with('-'))
-        .nth(1)                          // skip argv[0]
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SF);
-
-    if cli { run_cli(sf); } else { run_gui(sf); }
 }
