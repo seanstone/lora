@@ -338,8 +338,8 @@ impl GuiApp {
         let bw_khz        = 250u32;
         let (_, os_factor) = effective_sr_and_os(samp_rate_khz, bw_khz);
         let fft_size      = 1024usize;
-        let signal_db     = 0.0f32;
-        let noise_db      = -20.0f32;
+        let signal_db     = -20.0f32;  // typical received signal well below full scale
+        let noise_db      = -35.0f32;  // SNR = 15 dB — good outdoor link, noise visible
 
         let init_spec: Vec<[f64; 2]> = (0..fft_size).map(|i| [i as f64, -80.0]).collect();
 
