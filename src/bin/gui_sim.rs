@@ -228,7 +228,10 @@ struct Rx {
 impl Rx {
     fn new(sf: u8, cr: u8, os_factor: u32) -> Self { Self { sf, cr, os_factor } }
 
-    fn decode(&self, iq: &[Complex<f32>]) -> Option<Vec<u8>> {
+    /// Returns `(payload, preamble_start)` — `preamble_start` is the sample
+    /// offset in `iq` where the preamble begins, needed to drain the rx buffer
+    /// to exactly the right position after a successful decode.
+    fn decode(&self, iq: &[Complex<f32>]) -> Option<(Vec<u8>, usize)> {
         let sync = frame_sync(iq, self.sf, 0x12, 8, self.os_factor);
         if !sync.found { return None; }
         let chirps    = fft_demod(&sync.symbols, self.sf, self.os_factor);
@@ -246,7 +249,7 @@ impl Rx {
             let crc_nib = &info.payload_nibbles[2 * pay_len..2 * pay_len + 4];
             if !verify_crc(&payload, crc_nib) { return None; }
         }
-        Some(payload)
+        Some((payload, sync.preamble_start))
     }
 }
 
@@ -346,7 +349,7 @@ fn rx_worker(
 
         let window: Vec<_> = buf.iter().copied().collect();
         match rx.decode(&window) {
-            Some(decoded) => {
+            Some((decoded, preamble_start)) => {
                 let decoded_str = String::from_utf8_lossy(&decoded).to_string();
 
                 // Match against the TX metadata queue for accurate PER / log.
@@ -379,8 +382,10 @@ fn rx_worker(
                     if log.len() > MAX_LOG_ENTRIES { log.pop_front(); }
                 }
 
-                // Advance past the decoded packet.
-                let skip = min_pkt_samples(sf, os, decoded.len()).min(buf.len());
+                // Drain silence-before-packet + the packet itself so we don't
+                // re-decode the same packet on the next iteration.
+                let skip = (preamble_start + min_pkt_samples(sf, os, decoded.len()))
+                    .min(buf.len());
                 buf.drain(..skip);
             }
             None => {
@@ -462,7 +467,7 @@ const MAX_LOG_ENTRIES: usize = 200;
 
 // ─── Sim thread ───────────────────────────────────────────────────────────────
 
-fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
+fn sim_loop(shared: Arc<SimShared>, ctx: Option<egui::Context>) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x10_4a);
     let payloads: &[&[u8]] = &[
         b"Hello, LoRa!", b"Rust 2024", b"AWGN channel",
@@ -621,7 +626,7 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         shared.waterfall_plot.set_freq(fft_size as f64 / 2.0);
         shared.waterfall_plot.set_bw(fft_size as f64);
 
-        ctx.request_repaint();
+        if let Some(ref ctx) = ctx { ctx.request_repaint(); }
 
         let elapsed = tick_start.elapsed();
         if elapsed < TICK { std::thread::sleep(TICK - elapsed); }
@@ -770,7 +775,7 @@ impl eframe::App for GuiApp {
             self.thread_started = true;
             let shared = self.shared.clone();
             let ctx2   = ctx.clone();
-            std::thread::spawn(move || sim_loop(shared, ctx2));
+            std::thread::spawn(move || sim_loop(shared, Some(ctx2)));
         }
 
         let running = self.shared.running.load(Ordering::Relaxed);
@@ -966,10 +971,7 @@ impl eframe::App for GuiApp {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let sf = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7_u8);
-
+fn run_gui(sf: u8) {
     eframe::run_native(
         "LoRa Link Simulator",
         eframe::NativeOptions {
@@ -980,4 +982,42 @@ fn main() {
         },
         Box::new(move |_cc| Ok(Box::new(GuiApp::new(sf)))),
     ).unwrap();
+}
+
+fn run_cli(sf: u8) {
+    let app    = GuiApp::new(sf);
+    let shared = app.shared.clone();
+    std::thread::spawn(move || sim_loop(shared, None));
+
+    println!("LoRa CLI simulator  SF={sf}  SR={}kHz  BW={}kHz",
+        DEFAULT_SAMP_RATE_KHZ, DEFAULT_BW_KHZ);
+    println!("{:<8} {:<8} {:<8} {:<8}  last_rx",
+        "total", "ok", "PER%", "lag_ms");
+
+    let mut last_total = 0usize;
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let stats   = app.shared.stats.lock().unwrap().clone();
+        let lag_ms  = f32::from_bits(app.shared.buf_lag_ms.load(Ordering::Relaxed));
+        let per     = if stats.total > 0 {
+            100.0 * (stats.total - stats.ok) as f32 / stats.total as f32
+        } else { 0.0 };
+        if stats.total != last_total {
+            last_total = stats.total;
+            println!("{:<8} {:<8} {:<8.1} {:<8.0}  {}",
+                stats.total, stats.ok, per, lag_ms, stats.last_rx);
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cli = args.iter().any(|a| a == "--cli");
+    let sf  = args.iter()
+        .filter(|a| !a.starts_with('-'))
+        .nth(1)                          // skip argv[0]
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SF);
+
+    if cli { run_cli(sf); } else { run_gui(sf); }
 }
