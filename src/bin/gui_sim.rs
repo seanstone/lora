@@ -419,7 +419,7 @@ impl eframe::App for GuiApp {
         let stats   = self.shared.stats.lock().unwrap().clone();
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 // Pause / Run
                 if ui.button(if running { "⏸ Pause" } else { "▶ Run" }).clicked() {
                     self.shared.running.store(!running, Ordering::Relaxed);
