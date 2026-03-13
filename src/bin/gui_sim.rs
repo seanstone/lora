@@ -34,7 +34,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::{
     collections::VecDeque,
     f64::consts::TAU,
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU32, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -352,6 +352,10 @@ struct SimShared {
     waterfall_plot: Arc<WaterfallPlot>,
     stats:          Mutex<Stats>,
     log:            Mutex<VecDeque<LogEntry>>,
+    /// Display-buffer lag in ms (f32 bits stored in AtomicU32 for lock-free reads).
+    buf_lag_ms:     AtomicU32,
+    buf_overflow:   AtomicBool,
+    buf_underflow:  AtomicBool,
 }
 
 #[derive(Default, Clone)]
@@ -384,7 +388,10 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
     let mut filled_samples:   u64 = 0;
     let mut next_packet_at:   u64 = 0;
     let mut last_interval_ms: u64 = u64::MAX;
-    let mut tx_inflight = false;
+    let mut tx_inflight  = false;
+    // Packet samples not yet pushed to channel.pending; drained one tick at a time
+    // to keep the display buffer shallow and settings changes near-instant.
+    let mut tx_remainder: std::collections::VecDeque<Complex<f32>> = std::collections::VecDeque::new();
 
     // Spawn worker threads.
     let (rx_send,   rx_recv)   = std::sync::mpsc::channel::<RxJob>();
@@ -429,6 +436,7 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         // Flush channel on settings change; reset virtual clock.
         if shared.clear_buf.swap(false, Ordering::Relaxed) {
             channel.clear();
+            tx_remainder.clear();
             filled_samples   = 0;
             next_packet_at   = 0;
             last_interval_ms = u64::MAX;
@@ -469,23 +477,39 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         let target = filled_samples + samples_per_tick;
 
         while filled_samples < target {
+            // Phase 1: trickle leftover packet samples (one tick's worth at a time).
+            if !tx_remainder.is_empty() {
+                let n = (target - filled_samples).min(tx_remainder.len() as u64) as usize;
+                // drain n items from the front into a temporary slice
+                let batch: Vec<_> = (0..n).map(|_| tx_remainder.pop_front().unwrap()).collect();
+                channel.push_prebuilt(&batch);
+                filled_samples += n as u64;
+                continue;
+            }
+
             if next_packet_at <= filled_samples {
                 // Try to collect the pre-built packet; fill silence if not ready yet.
                 match tx_res_recv.try_recv() {
                     Ok(res) => {
                         let pkt_len = res.mixed.len() as u64;
-                        channel.push_prebuilt(&res.mixed);
-                        filled_samples += pkt_len;
-                        next_packet_at  = filled_samples + interval_samples;
-                        // Hand the same mixed IQ to the RX thread and immediately
-                        // pre-build the next packet while RX decodes this one.
+                        // Fix next_packet_at BEFORE modifying filled_samples.
+                        next_packet_at = filled_samples + pkt_len + interval_samples;
+
+                        // Push the first chunk this tick; rest goes to trickle buffer.
+                        let first_n = (target - filled_samples).min(pkt_len) as usize;
+                        channel.push_prebuilt(&res.mixed[..first_n]);
+                        filled_samples += first_n as u64;
+                        if first_n < res.mixed.len() {
+                            tx_remainder.extend(res.mixed[first_n..].iter().copied());
+                        }
+
+                        // Hand full mixed IQ to RX thread and pre-build the next packet.
                         let _ = rx_send.send(RxJob {
                             sf, cr: 4, os_factor,
                             payload: res.payload,
                             mixed:   res.mixed,
                         });
                         dispatch_tx!(sf, os_factor, signal_amp, noise_sigma);
-                        // tx_inflight = true is set by dispatch_tx! above
                     }
                     Err(_) => {
                         // Worker still generating; fill this tick with silence.
@@ -503,14 +527,24 @@ fn sim_loop(shared: Arc<SimShared>, ctx: egui::Context) {
         }
 
         // ── Channel → display thread: drain one tick's worth of FFT rows ─
-        let rows = ((samples_per_tick as usize / fft_size).max(1))
-            .min(MAX_ROWS_PER_TICK)
-            .min(channel.pending_len() / fft_size + 1);
+        let target_rows = (samples_per_tick as usize / fft_size).max(1).min(MAX_ROWS_PER_TICK);
+        let avail_rows  = channel.pending_len() / fft_size;
+        let rows        = target_rows.min(avail_rows.max(1)); // always at least 1 (noise fallback)
 
         for i in 0..rows {
             let window = channel.read(fft_size, &mut rng);
             let _ = disp_send.send((window, i + 1 == rows));
         }
+
+        // ── Buffer status ─────────────────────────────────────────────────
+        // Total unplayed samples = pending + trickle remainder.
+        let unplayed   = channel.pending_len() + tx_remainder.len();
+        let lag_ms     = unplayed as f32 * 1000.0 / samp_rate_hz as f32;
+        let overflow   = avail_rows > target_rows * 8; // >8× a tick's worth backed up
+        let underflow  = avail_rows == 0;
+        shared.buf_lag_ms   .store(lag_ms.to_bits(),         Ordering::Relaxed);
+        shared.buf_overflow .store(overflow,                  Ordering::Relaxed);
+        shared.buf_underflow.store(underflow,                 Ordering::Relaxed);
 
         shared.waterfall_plot.set_freq(fft_size as f64 / 2.0);
         shared.waterfall_plot.set_bw(fft_size as f64);
@@ -584,6 +618,9 @@ impl GuiApp {
             waterfall_plot,
             stats:          Mutex::new(Stats::default()),
             log:            Mutex::new(VecDeque::new()),
+            buf_lag_ms:     AtomicU32::new(0),
+            buf_overflow:   AtomicBool::new(false),
+            buf_underflow:  AtomicBool::new(false),
         });
 
         Self {
@@ -783,6 +820,22 @@ impl eframe::App for GuiApp {
                 });
             });
 
+            // ── Row 3: buffer status ──────────────────────────────────────────
+            ui.horizontal(|ui| {
+                let lag_ms   = f32::from_bits(self.shared.buf_lag_ms  .load(Ordering::Relaxed));
+                let overflow  = self.shared.buf_overflow .load(Ordering::Relaxed);
+                let underflow = self.shared.buf_underflow.load(Ordering::Relaxed);
+
+                let (color, label) = if underflow {
+                    (egui::Color32::from_rgb(220, 160, 0), "⚠ UNDERFLOW")
+                } else if overflow {
+                    (egui::Color32::from_rgb(220, 60, 60),  "⚠ OVERFLOW")
+                } else {
+                    (egui::Color32::from_rgb(100, 180, 100), "●")
+                };
+                ui.colored_label(color, label);
+                ui.label(format!("buf {lag_ms:.0} ms"));
+            });
         });
 
         egui::SidePanel::right("msg_log")
